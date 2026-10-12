@@ -1,6 +1,284 @@
-streamlit>=1.36.0
-sentence-transformers>=2.2.2
-faiss-cpu>=1.8.1
-numpy>=1.26.0
-requests>=2.32.0
-python-dotenv>=1.0.1
+import json
+import re
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+import faiss
+import numpy as np
+import requests
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+
+
+class RAGSystem:
+    SUPPORTED_EXTENSIONS = {".txt", ".md", ".csv", ".pdf"}
+
+    def __init__(
+        self,
+        docs_dir: str = "data",
+        index_dir: str = ".rag_index",
+        embed_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        ollama_model: str = "llama3.2",
+        ollama_base_url: str = "http://localhost:11434",
+        chunk_size: int = 400,
+        overlap: int = 80,
+    ):
+        self.docs_dir = Path(docs_dir)
+        self.index_dir = Path(index_dir)
+        self.docs_dir.mkdir(parents=True, exist_ok=True)
+        self.index_dir.mkdir(parents=True, exist_ok=True)
+
+        self.embed_model_name = embed_model
+        self.ollama_model = ollama_model
+        self.ollama_base_url = ollama_base_url.rstrip("/")
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+
+        self.embedder = SentenceTransformer(self.embed_model_name)
+        self.index = None
+        self.documents: List[str] = []
+        self.metadata: List[str] = []
+
+        self.index_path = self.index_dir / "faiss.index"
+        self.metadata_path = self.index_dir / "documents.json"
+
+    def list_source_files(self) -> List[str]:
+        files = []
+        if not self.docs_dir.exists():
+            return files
+
+        for path in sorted(self.docs_dir.rglob("*")):
+            if path.is_file() and path.suffix.lower() in self.SUPPORTED_EXTENSIONS:
+                files.append(str(path.relative_to(self.docs_dir)))
+        return files
+
+    def _ensure_example_file(self) -> None:
+        sample_path = self.docs_dir / "knowledge.md"
+        if not sample_path.exists():
+            sample_path.write_text(
+                "# Local RAG Assistant Knowledge\n\n"
+                "This is a starter local RAG project for JAMwithAI.\n\n"
+                "Use this app to chat with your own local documents.\n\n"
+                "A local RAG system works by indexing text, retrieving relevant chunks, and sending those chunks to a language model for a grounded answer.\n",
+                encoding="utf-8",
+            )
+
+    def _read_text_file(self, file_path: Path) -> str:
+        if file_path.suffix.lower() == ".pdf":
+            reader = PdfReader(str(file_path))
+            pages = []
+            for page in reader.pages:
+                content = page.extract_text() or ""
+                pages.append(content)
+            return "\n".join(pages)
+
+        return file_path.read_text(encoding="utf-8", errors="ignore")
+
+    def _read_documents(self) -> List[Tuple[str, str]]:
+        self._ensure_example_file()
+
+        files = []
+        for path in sorted(self.docs_dir.rglob("*")):
+            if path.is_file() and path.suffix.lower() in self.SUPPORTED_EXTENSIONS:
+                try:
+                    content = self._read_text_file(path)
+                    if content.strip():
+                        files.append((str(path.relative_to(self.docs_dir)), content))
+                except Exception:
+                    continue
+
+        return files
+
+    def _chunk_text(self, text: str, source_name: str) -> List[str]:
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        if not cleaned:
+            return []
+
+        words = cleaned.split()
+        chunks: List[str] = []
+        step = max(1, self.chunk_size - self.overlap)
+
+        for i in range(0, len(words), step):
+            chunk = words[i : i + self.chunk_size]
+            if not chunk:
+                continue
+            chunks.append(f"Source: {source_name}\n\n" + " ".join(chunk))
+
+        return chunks
+
+    def _load_index_if_available(self) -> bool:
+        if not self.index_path.exists() or not self.metadata_path.exists():
+            return False
+
+        try:
+            self.index = faiss.read_index(str(self.index_path))
+            payload = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            self.documents = payload.get("documents", [])
+            self.metadata = payload.get("metadata", [])
+            return True
+        except Exception:
+            return False
+
+    def _save_index(self) -> None:
+        if self.index is None:
+            return
+
+        faiss.write_index(self.index, str(self.index_path))
+        payload = {"documents": self.documents, "metadata": self.metadata}
+        self.metadata_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def build_index(self, force_rebuild: bool = False) -> None:
+        if not force_rebuild and self._load_index_if_available():
+            return
+
+        files = self._read_documents()
+        all_documents: List[str] = []
+        all_metadata: List[str] = []
+
+        for source_name, content in files:
+            chunks = self._chunk_text(content, source_name)
+            all_documents.extend(chunks)
+            all_metadata.extend([source_name] * len(chunks))
+
+        if not all_documents:
+            raise ValueError("No text found in the documents folder. Add .txt, .md, .csv, or .pdf files.")
+
+        embeddings = self.embedder.encode(all_documents, convert_to_numpy=True, show_progress_bar=False)
+        embeddings = np.asarray(embeddings, dtype="float32")
+
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+
+        self.index = index
+        self.documents = all_documents
+        self.metadata = all_metadata
+        self._save_index()
+
+    def _search(self, query: str, top_k: int = 4) -> List[Tuple[str, float, str]]:
+        if self.index is None:
+            raise ValueError("Index has not been built yet. Call build_index() first.")
+
+        query_embedding = self.embedder.encode([query], convert_to_numpy=True)
+        query_embedding = np.asarray(query_embedding, dtype="float32")
+        distances, indices = self.index.search(query_embedding, min(top_k, len(self.documents)))
+
+        results = []
+        for i, index_position in enumerate(indices[0]):
+            if index_position < 0:
+                continue
+            results.append(
+                (
+                    self.documents[int(index_position)],
+                    float(distances[0][i]),
+                    self.metadata[int(index_position)],
+                )
+            )
+        return results
+
+    def answer_question(self, question: str, chat_history: Optional[List[dict]] = None, top_k: int = 4) -> str:
+        results = self._search(question, top_k=top_k)
+
+        if not results:
+            return "I could not find relevant information in the indexed documents yet."
+
+        context = "\n\n---\n\n".join(chunk for chunk, _, _ in results)
+
+        chat_context = ""
+        if chat_history:
+            recent_history = chat_history[-6:]
+            chat_context = "\n".join(
+                f"{entry['role']}: {entry['content']}" for entry in recent_history if entry.get("content")
+            )
+
+        prompt = (
+            "You are a helpful assistant. Answer the user's question using the provided context and prior chat history when relevant. "
+            "If the answer is not in the documents, say so clearly.\n\n"
+            f"Previous chat:\n{chat_context}\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {question}\n\n"
+            "Answer:"
+        )
+
+        try:
+            response = requests.post(
+                f"{self.ollama_base_url}/api/generate",
+                json={
+                    "model": self.ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                },
+                timeout=120,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Ollama request failed: {exc}") from exc
+
+        if response.status_code != 200:
+            raise RuntimeError(f"Ollama request failed: {response.status_code} - {response.text}")
+
+        payload = response.json()
+
+        if isinstance(payload, dict):
+            candidate = payload.get("response")
+            if candidate:
+                return candidate
+
+            message = payload.get("message", {})
+            if isinstance(message, dict):
+                content = message.get("content")
+                if content:
+                    return content
+
+            if "output" in payload:
+                return str(payload["output"])
+
+            return str(payload)
+
+        return str(payload)
+
+    def validate_ollama(self) -> bool:
+        try:
+            response = requests.get(f"{self.ollama_base_url}/api/tags", timeout=10)
+            return response.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def list_ollama_models(self) -> List[str]:
+        try:
+            response = requests.get(f"{self.ollama_base_url}/api/tags", timeout=10)
+            if response.status_code != 200:
+                return []
+
+            payload = response.json()
+            models = payload.get("models", [])
+            names = []
+            for model in models:
+                if isinstance(model, dict):
+                    model_name = model.get("name")
+                    if model_name:
+                        names.append(model_name)
+            return names
+        except requests.RequestException:
+            return []
+
+    def save_uploaded_files(self, uploaded_files) -> List[str]:
+        if not uploaded_files:
+            return []
+
+        upload_dir = self.docs_dir / "uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_paths: List[str] = []
+
+        for uploaded_file in uploaded_files:
+            try:
+                file_name = Path(uploaded_file.name).name
+                destination = upload_dir / file_name
+                if destination.exists():
+                    destination.unlink()
+
+                destination.write_bytes(uploaded_file.read())
+                saved_paths.append(str(destination.relative_to(self.docs_dir)))
+            except Exception:
+                continue
+
+        return saved_paths
